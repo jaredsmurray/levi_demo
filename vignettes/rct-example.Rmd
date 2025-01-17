@@ -142,6 +142,12 @@ muhat_posterior <- bcf_model$mu_hat_train
 tauhat_posterior <- bcf_model$tau_hat_train/sd(y)
 ```
 
+Each of these is a matrix; each row is an individual, and the columns are 3,000 samples from the posterior distribution of an individual's predicted value, predicted value under control, and their estimated personalized treatment effect.
+
+```{r}
+dim(tauhat_posterior)
+```
+
 ### Predictive accuracy
 
 Compare the average predicted outcome from the BCF model versus actual y, for a sanity check.
