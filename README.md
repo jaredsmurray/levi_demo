@@ -1,6 +1,6 @@
-# ICHPS 2025 BART Workshop Materials
+# Bayesian Modeling Hub Demo
 
-This repository hosts slides, data, and vignettes from the 2025 ICHPS BART Workshop.
+This repository hosts slides, data, and vignettes from the January 2025 demo.
 
 ## Software dependencies
 
