@@ -1,0 +1,321 @@
+---
+title: "Demo of Bayesian Causal Forests on a Randomized Controlled Trial"
+author: "Jared Murray, Drew Herren"
+date: "`r Sys.Date()`"
+bibliography: bcf_ichps.bib
+output: 
+    html_document: default
+    pdf_document: default
+knit: |
+  (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_file = paste0(
+        xfun::sans_ext(input), '-', Sys.Date()
+      ),
+      output_dir = "output",
+      output_format = "html_document",
+      envir = globalenv()
+    )
+  })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "../")
+```
+
+## Introduction
+
+In this vignette we re-analyze data from study 6 in ["A synergistic mindsets intervention protects adolescents from stress (\@yeager2022synergistic)"](https://www.nature.com/articles/s41586-022-04907-7). The study was a randomized controlled trial of a light-touch synergistic mindsets intervention. Variables include:
+
+-   `testanxiety`: A measure of the student's test anxiety
+-   `sex`: 1 if M, 0 if F
+-   `stressmindset_baseline`: Pre-treatment stress mindset; lower values indicate positive stress-can-be-enhancing mindsets
+-   `fixedmindset_baseline`: Pre-treatment growth/fixed mindset; lower values indicate positive growth mindsets
+-   `pss_impute`: A measure of perceived social stress at baseline
+-   `fgen_moth`: 1 if the student is a first-generation college student on their mother's side
+-   `fgen_fath`: 1 if the student is a first-generation college student on their father's side
+-   `ses`: A measure of socioeconomic status
+
+The outcome `anxiety` is a measure of anxiety (GAD-7).
+
+First, we load requisite packages.
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(stochtree)
+library(ggplot2)
+library(coda)
+library(possum)
+library(rpart)
+library(rpart.plot)
+library(tidyverse)
+library(here)
+```
+
+## Dataset
+
+Next we import and process the data:
+
+```{r}
+# Import dataset
+file_path <- file.path(here(), "data/rct/synergistic_study6.csv")
+df <- read.csv(file_path)
+```
+
+And unpack the data into BCF components: outcome, treatment, and covariates.
+
+We also create two new variables from the baseline fixed and stress mindset scores (where higher scores correspond to more fixed mindsets and less stress-can-be-enhancing mindsets) by adding and multiplying them. Since the hypothesis was that the treatment would be most effective for students with poor growth and stress mindsets, adding these coordinates will allow the trees to make one split to isolate groups that are high or low on both mindset scores. Feature engineering like this can be very helpful when using tree-based methods in general, especially when the sample size is small.
+
+```{r}
+# Outcome
+y <- df$anxiety
+
+# Treatment
+Z <- df$treatment
+
+# Covariates
+covariate_df <- dplyr::select(df, -treatment, -anxiety) %>%   
+  mutate(bothplus = stressmindset_baseline + fixedmindset_baseline,
+         bothprod = scale(stressmindset_baseline)*scale(fixedmindset_baseline)) %>%
+  data.frame()
+```
+
+## Model Run
+
+Fit the BCF model
+
+$$
+y_i = \mu(x_i) + \tau(x_i)z_i + \epsilon_i,\ \ \epsilon_i\sim N(0,\sigma^2)
+$$
+
+with 100 "warm-start" iterations and 3000 MCMC iterations after 100 burn-in iterations. Since this is a randomized controlled trial we omit a fitted propensity score.
+
+We also tweak a couple of the BCF defaults:
+
+-   We turn off adaptive coding of the treatment dummies, and
+-   we increase the probability that a heterogeneity tree splits at least once (`alpha_tau` from 0.25 to 0.95).
+
+The BCF defaults were developed for scenarios with moderate to strong confounding and weak prior evidence of heterogeneous effects. Here we have a randomized trial, and lots of prior evidence and theory that suggests effects should be heterogeneous.
+
+```{r}
+random_seed <- 121
+set.seed(random_seed)
+t0 <- Sys.time()
+num_gfr <- 100
+num_burnin <- 100
+num_mcmc <- 3000
+bcf_params <- list(
+    propensity_covariate = 'none', 
+    cutpoint_grid_size = 100, 
+    sample_sigma_leaf_tau = T, 
+    sample_sigma_leaf_mu = T, 
+    adaptive_coding = F, 
+    alpha_tau = 0.95, 
+    random_seed = random_seed
+)
+bcf_model <- bcf(X_train = covariate_df, Z_train = Z, y_train = y, 
+                 num_gfr = num_gfr, 
+                 num_burnin = num_burnin, num_mcmc = num_mcmc, 
+                 params = bcf_params)
+t1 <- Sys.time()
+t1 - t0
+```
+
+## Analysis
+
+First some high-level diagnostics using `coda`:
+
+```{r}
+coda_s2 = mcmc(bcf_model$sigma2_samples)
+summary(coda_s2)
+plot(coda_s2)
+acfplot(coda_s2)
+effectiveSize(coda_s2)
+```
+
+Extract observation-level outputs of the model: Fitted values, predicted values under control, and the *standardized* estimated treatment effects.
+
+```{r}
+yhat_posterior <- bcf_model$y_hat_train
+muhat_posterior <- bcf_model$mu_hat_train
+tauhat_posterior <- bcf_model$tau_hat_train/sd(y)
+```
+
+### Predictive accuracy
+
+Compare the average predicted outcome from the BCF model versus actual y, for a sanity check.
+
+```{r}
+plot(rowMeans(yhat_posterior), y, xlab = "predicted", ylab = "actual", 
+     main = "Outcome")
+abline(0,1,col="red",lty=3,lwd=3)
+```
+
+### Estimated conditional average treatment effects (CATEs)
+
+`tauhat_posterior` contains posterior samples of CATEs for each observation. Typically these are very uncertain, and inference will focus on aggregations or summaries of CATEs.
+
+```{r}
+tauhat = rowMeans(tauhat_posterior)
+
+hist(tauhat, breaks=100)
+boxplot(t(tauhat_posterior)[,order(tauhat)])
+abline(h=0, lty=2, col='red')
+```
+
+### Average treatment effects
+
+Extract and examine the posterior distribution of the ATE. There is little evidence to suggest a negative (beneficial) treatment effect overall. But this doesn't mean that effects are zero everywhere!
+
+```{r}
+ate_dist <- colMeans(bcf_model$tau_hat_train)
+
+hist(ate_dist, xlab = "ATE", ylab = "Density", main = "Average Treatment Effect", freq = F)
+ate <- mean(ate_dist)
+ate_lb <- quantile(ate_dist, 0.025)
+ate_ub <- quantile(ate_dist, 0.975)
+abline(v = ate, lty = 3, lwd = 3, col = "black")
+abline(v = ate_lb, lty = 3, lwd = 3, col = "blue")
+abline(v = ate_ub, lty = 3, lwd = 3, col = "blue")
+
+# Checking diagnostics again
+coda_ate = mcmc(ate_dist)
+summary(coda_ate)
+plot(coda_ate)
+acfplot(coda_ate)
+effectiveSize(coda_ate)
+```
+
+#### Subgroup ATEs
+
+We can start examining heterogeneity by looking at subgroup averages, first by their baseline mindsets and then by a measure of socioeconomic status.
+
+```{r}
+subgroup_defs = covariate_df %>% 
+  mutate(stress_group = ifelse(stressmindset_baseline>3, "Stress.Bad", "Stress.Good"),
+         fixed_group  = ifelse(fixedmindset_baseline>3, "Fixed.Bad", "Fixed.Good"),
+         doublemindset = interaction(stress_group, fixed_group),
+         doublebad = ifelse(doublemindset=="Stress.Bad.Fixed.Bad", "Neg Prior Mindset", "Other Prior Mindset")
+    )
+
+subgroup_ates = subgroup_average_posterior(t(tauhat_posterior),subgroup_defs$doublemindset)
+ggplot(aes(x=value, color=subgroup), data=gather(subgroup_ates, key="subgroup"))+geom_density()
+ggplot(aes(x=value, color=factor(subgroup=="Stress.Bad.Fixed.Bad")), data=gather(subgroup_ates, key="subgroup"))+geom_density()
+
+coda_subate = mcmc(subgroup_ates)
+summary(coda_subate)
+acfplot(coda_subate)
+effectiveSize(coda_subate)
+
+db_ates = subgroup_average_posterior(t(tauhat_posterior),
+                                     subgroup_defs$doublebad)
+plot(density(db_ates[,1] - db_ates[,2])); abline(v=0)
+
+fgen_subgroup_ates = subgroup_average_posterior(t(tauhat_posterior), ifelse(df$fgen_moth, "FirstGenMom", "NonFirstGenMom"))
+
+# Posterior densities
+ggplot(aes(x=value, color=subgroup), 
+       data=gather(fgen_subgroup_ates, key="subgroup"))+geom_density()
+plot(density(fgen_subgroup_ates[,1] - fgen_subgroup_ates[,2])); abline(v=0)
+
+# Posterior prob <0
+colMeans(fgen_subgroup_ates>0)
+
+# Negative mindsets & firstgen
+fgen_db_subgroup_ates = subgroup_average_posterior(t(tauhat_posterior), df$fgen_moth & subgroup_defs$doublebad == "Neg Prior Mindset")
+ggplot(aes(x=value, color=subgroup), 
+       data=gather(fgen_db_subgroup_ates, key="subgroup"))+geom_density()
+colMeans(fgen_db_subgroup_ates<0)
+```
+
+#### CART Subgroup Search
+
+We can search over possible subgroups by "fitting the fit" with a CART tree -- we get back a set of subgroups that (approximately) maximally separate their subgroup ATEs.
+
+```{r}
+treefit = rpart(rowMeans(tauhat_posterior)~., data=covariate_df,
+                control=rpart.control(maxdepth=2))
+rpart.plot(treefit)
+
+LowSES_NegMindsets = covariate_df$fgen_moth==1 & covariate_df$bothplus>8.2
+subgroup_ates = subgroup_average_posterior(t(tauhat_posterior), LowSES_NegMindsets)
+ggplot(aes(x=value, color=LowSES_NegMindsets), 
+       data=gather(subgroup_ates, key="LowSES_NegMindsets"))+geom_density()
+
+apply(subgroup_ates, 2, function(x) quantile(x, c(0.025, 0.1, 0.5, 0.9, 0.975)))
+
+```
+
+Deeper trees better approximate $\tau$ at the cost of complexity and a loss of interpretability.
+
+```{r}
+treefit = rpart(rowMeans(tauhat_posterior)~., data=covariate_df,
+                control=rpart.control(maxdepth=3))
+rpart.plot(treefit)
+```
+
+#### Additive summaries and partial effects of prior mindsets
+
+Perceived social stress (PSS) was recorded primarily to *exclude* it as a driver of any observed moderation by baseline mindsets -- that is, we'd like to partial it out of our estimates of effect variation by baseline mindsets. Subgroup analysis is not well suited to estimating partial effects. Instead we try additive summaries using the `possum` package:
+
+```{r message=FALSE, warning=FALSE}
+# Appending the model fits to the data frame
+model_df <- covariate_df
+model_df$tauhat <- rowMeans(bcf_model$tau_hat_train)
+
+# Specify the model summary formula using our three focal variables, plus fgen_moth
+
+# Explicitly call out categorical variables by wrapping them in factor()
+# in the formula specification
+ff = tauhat ~ factor(fgen_moth) +
+  s(stressmindset_baseline) + s(fixedmindset_baseline) + s(pss_impute)
+
+gf = additive_summary(ff, bcf_model$tau_hat_train, df=model_df, fast=FALSE)
+additive_summary_plot(gf)
+additive_summary_triangle_plot(gf)
+```
+
+Once more, with all the variables:
+
+```{r message=FALSE, warning=FALSE}
+ff = tauhat ~ factor(fgen_moth) + factor(fgen_fath) + factor(ses) + factor(sex) + 
+  s(testanxiety) + s(stressmindset_baseline)+s(fixedmindset_baseline )+s(pss_impute)
+
+gf = additive_summary(ff, bcf_model$tau_hat_train, df=model_df, fast=FALSE)
+additive_summary_plot(gf)
+additive_summary_triangle_plot(gf)
+
+
+
+gfpm = gam(rowMeans(bcf_model$tau_hat_train) ~ factor(fgen_moth) + factor(fgen_fath) +
+  factor(ses) + factor(sex) + factor(ses) +
+  s(testanxiety) + s(fixedmindset_baseline,stressmindset_baseline)+s(pss_impute), data=covariate_df)
+
+gf = additive_summary(ff, bcf_model$tau_hat_train, df=covariate_df, fast=FALSE)
+additive_summary_plot(gf)
+additive_summary_triangle_plot(gf)
+```
+
+Looking at (approximate) partial effects of categorical variables:
+
+```{r message=FALSE, warning=FALSE}
+factor_post = get_additive_factor_posterior(gf)
+factor_post %>% 
+  group_by(term) %>% 
+  summarize(est = mean(post), lo=quantile(post, 0.05), hi=quantile(post, 0.95))
+ggplot(aes(x=post), data=factor_post) + geom_density() + facet_grid(~term)
+```
+
+And again, summarizing by the sum of the two mindset scores instead of the individual scores
+
+```{r message=FALSE, warning=FALSE}
+ff = tauhat ~ factor(fgen_moth) + factor(fgen_fath) + factor(ses) + factor(sex) + 
+  s(testanxiety) + s(bothplus )+s(pss_impute)
+
+gf = additive_summary(ff, bcf_model$tau_hat_train, df=model_df, fast=FALSE)
+additive_summary_plot(gf)
+additive_summary_triangle_plot(gf)
+```
+
+## References
